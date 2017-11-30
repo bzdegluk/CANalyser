@@ -41,11 +41,10 @@ from can.broadcastmanager import ModifiableCyclicTaskABC, RestartableCyclicTaskA
 # The 32bit can id is directly followed by the 8bit data link count
 # The data field is aligned on an 8 byte boundary, hence we add padding
 # which aligns the data field to an 8 byte boundary.
-can_frame_fmt = "=IB3x8s"
-can_frame_size = struct.calcsize(can_frame_fmt)
+CAN_FRAME_HEADER_STRUCT = struct.Struct("=IBB2x")
 
 
-def build_can_frame(can_id, data):
+def build_can_frame(msg):
     """ CAN frame packing/unpacking (see 'struct can_frame' in <linux/can.h>)
     /**
      * struct can_frame - basic CAN frame structure
@@ -58,10 +57,34 @@ def build_can_frame(can_id, data):
         __u8    can_dlc; /* data length code: 0 .. 8 */
         __u8    data[8] __attribute__((aligned(8)));
     };
+
+    /**
+    * struct canfd_frame - CAN flexible data rate frame structure
+    * @can_id: CAN ID of the frame and CAN_*_FLAG flags, see canid_t definition
+    * @len:    frame payload length in byte (0 .. CANFD_MAX_DLEN)
+    * @flags:  additional flags for CAN FD
+    * @__res0: reserved / padding
+    * @__res1: reserved / padding
+    * @data:   CAN FD frame payload (up to CANFD_MAX_DLEN byte)
+    */
+    struct canfd_frame {
+        canid_t can_id;  /* 32 bit CAN_ID + EFF/RTR/ERR flags */
+        __u8    len;     /* frame payload length in byte */
+        __u8    flags;   /* additional flags for CAN FD */
+        __u8    __res0;  /* reserved / padding */
+        __u8    __res1;  /* reserved / padding */
+        __u8    data[CANFD_MAX_DLEN] __attribute__((aligned(8)));
+    };
     """
-    can_dlc = len(data)
-    data = data.ljust(8, b'\x00')
-    return struct.pack(can_frame_fmt, can_id, can_dlc, data)
+    can_id = _add_flags_to_can_id(msg)
+    flags = 0
+    if msg.bitrate_switch:
+        flags |= CANFD_BRS
+    if msg.error_state_indicator:
+        flags |= CANFD_ESI
+    max_len = 64 if msg.is_fd else 8
+    data = msg.data.ljust(max_len, b'\x00')
+    return CAN_FRAME_HEADER_STRUCT.pack(can_id, msg.dlc, flags) + data
 
 
 def build_bcm_header(opcode, flags, count, ival1_seconds, ival1_usec, ival2_seconds, ival2_usec, can_id, nframes):
@@ -87,15 +110,16 @@ def build_bcm_header(opcode, flags, count, ival1_seconds, ival1_usec, ival2_seco
                        nframes)
 
 
-def build_bcm_tx_delete_header(can_id):
+def build_bcm_tx_delete_header(can_id, flags):
     opcode = CAN_BCM_TX_DELETE
-    return build_bcm_header(opcode, 0, 0, 0, 0, 0, 0, can_id, 1)
+    return build_bcm_header(opcode, flags, 0, 0, 0, 0, 0, can_id, 1)
 
 
-def build_bcm_transmit_header(can_id, count, initial_period, subsequent_period):
+def build_bcm_transmit_header(can_id, count, initial_period, subsequent_period,
+                              msg_flags):
     opcode = CAN_BCM_TX_SETUP
 
-    flags = SETTIMER | STARTTIMER
+    flags = msg_flags | SETTIMER | STARTTIMER
 
     if initial_period > 0:
         # Note `TX_COUNTEVT` creates the message TX_EXPIRED when count expires
@@ -115,8 +139,11 @@ def build_bcm_transmit_header(can_id, count, initial_period, subsequent_period):
 
 
 def dissect_can_frame(frame):
-    can_id, can_dlc, data = struct.unpack(can_frame_fmt, frame)
-    return can_id, can_dlc, data[:can_dlc]
+    can_id, can_dlc, flags = CAN_FRAME_HEADER_STRUCT.unpack_from(frame)
+    if len(frame) == 16:
+        # Flags not valid in non-FD frames
+        flags = 0
+    return can_id, can_dlc, flags, frame[8:8+can_dlc]
 
 
 def create_bcm_socket(channel):
@@ -205,8 +232,10 @@ class CyclicSendTask(SocketCanBCMBase, LimitedDurationCyclicSendTaskABC, Modifia
     def _tx_setup(self, message):
         # Create a low level packed frame to pass to the kernel
         self.can_id_with_flags = _add_flags_to_can_id(message)
-        header = build_bcm_transmit_header(self.can_id_with_flags, 0, 0.0, self.period)
-        frame = build_can_frame(self.can_id_with_flags, message.data)
+        self.flags = CAN_FD_FRAME if message.is_fd else 0
+        header = build_bcm_transmit_header(self.can_id_with_flags, 0, 0.0,
+                                           self.period, self.flags)
+        frame = build_can_frame(message)
         log.debug("Sending BCM command")
         send_bcm(self.bcm_socket, header + frame)
 
@@ -219,7 +248,7 @@ class CyclicSendTask(SocketCanBCMBase, LimitedDurationCyclicSendTaskABC, Modifia
         """
         log.debug("Stopping periodic task")
 
-        stopframe = build_bcm_tx_delete_header(self.can_id_with_flags)
+        stopframe = build_bcm_tx_delete_header(self.can_id_with_flags, self.flags)
         send_bcm(self.bcm_socket, stopframe)
 
     def modify_data(self, message):
@@ -245,12 +274,13 @@ class MultiRateCyclicSendTask(CyclicSendTask):
         super(MultiRateCyclicSendTask, self).__init__(channel, message, subsequent_period)
 
         # Create a low level packed frame to pass to the kernel
-        frame = build_can_frame(self.can_id, message.data)
+        frame = build_can_frame(message)
         header = build_bcm_transmit_header(
-            self.can_id,
+            self.can_id_with_flags,
             count,
             initial_period,
-            subsequent_period)
+            subsequent_period,
+            self.flags)
 
         log.info("Sending BCM TX_SETUP command")
         send_bcm(self.bcm_socket, header + frame)
@@ -308,7 +338,7 @@ def captureMessage(sock):
     """
     # Fetching the Arb ID, DLC and Data
     try:
-        cf, addr = sock.recvfrom(can_frame_size)
+        cf, addr = sock.recvfrom(CAN_FRAME_HEADER_STRUCT.size + 64)
     except BlockingIOError:
         log.debug('Captured no data, socket in non-blocking mode.')
         return None
@@ -320,7 +350,7 @@ def captureMessage(sock):
         log.exception("Captured no data.")
         return None
 
-    can_id, can_dlc, data = dissect_can_frame(cf)
+    can_id, can_dlc, flags, data = dissect_can_frame(cf)
     log.debug('Received: can_id=%x, can_dlc=%x, data=%s', can_id, can_dlc, data)
 
     # Fetching the timestamp
@@ -338,6 +368,9 @@ def captureMessage(sock):
     is_extended_frame_format = bool(can_id & 0x80000000)
     is_remote_transmission_request = bool(can_id & 0x40000000)
     is_error_frame = bool(can_id & 0x20000000)
+    is_fd = len(cf) > 16
+    bitrate_switch = bool(flags & CANFD_BRS)
+    error_state_indicator = bool(flags & CANFD_ESI)
 
     if is_extended_frame_format:
         log.debug("CAN: Extended")
@@ -352,25 +385,30 @@ def captureMessage(sock):
                    extended_id=is_extended_frame_format,
                    is_remote_frame=is_remote_transmission_request,
                    is_error_frame=is_error_frame,
+                   is_fd=is_fd,
+                   bitrate_switch=bitrate_switch,
+                   error_state_indicator=error_state_indicator,
                    dlc=can_dlc,
                    data=data)
 
 
 class SocketcanNative_Bus(BusABC):
-    channel_info = "native socketcan channel"
 
-    def __init__(self, channel, receive_own_messages=False, **kwargs):
+    def __init__(self, channel, receive_own_messages=False, fd=False, **kwargs):
         """
         :param str channel:
             The can interface name with which to create this bus. An example channel
             would be 'vcan0'.
         :param bool receive_own_messages:
             If messages transmitted should also be received back.
+        :param bool fd:
+            If CAN-FD frames should be supported.
         :param list can_filters:
             A list of dictionaries, each containing a "can_id" and a "can_mask".
         """
         self.socket = createSocket(CAN_RAW)
         self.channel = channel
+        self.channel_info = "native socketcan channel '%s'" % channel
 
         # Add any socket options such as can frame filters
         if 'can_filters' in kwargs and len(kwargs['can_filters']) > 0:
@@ -382,6 +420,11 @@ class SocketcanNative_Bus(BusABC):
                                    struct.pack('i', receive_own_messages))
         except Exception as e:
             log.error("Could not receive own messages (%s)", e)
+
+        if fd:
+            self.socket.setsockopt(socket.SOL_CAN_RAW,
+                                   socket.CAN_RAW_FD_FRAMES,
+                                   struct.pack('i', 1))
 
         bindSocket(self.socket, channel)
         super(SocketcanNative_Bus, self).__init__()
@@ -407,23 +450,13 @@ class SocketcanNative_Bus(BusABC):
 
     def send(self, msg, timeout=None):
         log.debug("We've been asked to write a message to the bus")
-        arbitration_id = msg.arbitration_id
-        if msg.id_type:
-            log.debug("sending an extended id type message")
-            arbitration_id |= 0x80000000
-        if msg.is_remote_frame:
-            log.debug("requesting a remote frame")
-            arbitration_id |= 0x40000000
-        if msg.is_error_frame:
-            log.warning("Trying to send an error frame - this won't work")
-            arbitration_id |= 0x20000000
         l = log.getChild("tx")
         l.debug("sending: %s", msg)
         if timeout:
             # Wait for write availability. send will fail below on timeout
             select.select([], [self.socket], [], timeout)
         try:
-            bytes_sent = self.socket.send(build_can_frame(arbitration_id, msg.data))
+            bytes_sent = self.socket.send(build_can_frame(msg))
         except OSError as exc:
             raise can.CanError("Transmit failed (%s)" % exc)
         if bytes_sent == 0:
